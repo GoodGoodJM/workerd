@@ -155,6 +155,10 @@ impl TokioPort {
     /// Panics if the tokio runtime cannot be built.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_builder(&mut Builder::new_current_thread())
+    }
+
+    fn with_builder(builder: &mut Builder) -> Self {
         let state = Arc::new(SharedState {
             notify: Notify::new(),
             woken: AtomicBool::new(false),
@@ -164,7 +168,7 @@ impl TokioPort {
             clippy::expect_used,
             reason = "startup-only: building the per-thread current_thread runtime fails only under resource exhaustion, at which point fail-fast at port construction is the correct behavior"
         )]
-        let runtime = Builder::new_current_thread()
+        let runtime = builder
             .enable_time()
             // The I/O driver dispatches readiness for tokio sockets (used by kj-rs-io's
             // tokio-backed KJ streams). It is only *driven* while this runtime is inside
@@ -240,6 +244,13 @@ impl TokioPort {
     }
 
     pub(crate) fn wait_timeout_ns(&self, timeout_ns: u64) -> bool {
+        // The next KJ timer is already due, so don't sleep. A zero-duration
+        // tokio::time::timeout() still goes through the timer wheel, which rounds up
+        // to the next millisecond.
+        if timeout_ns == 0 {
+            // KJ calls wait() again on its next iteration, so I/O gets another chance each time.
+            return self.poll_with_budget(1);
+        }
         self.wait_impl(Some(Duration::from_nanos(timeout_ns)))
     }
 
@@ -277,6 +288,10 @@ impl TokioPort {
     }
 
     pub(crate) fn poll(&self) -> bool {
+        self.poll_with_budget(POLL_YIELD_BUDGET)
+    }
+
+    fn poll_with_budget(&self, budget: u32) -> bool {
         // Bounded, non-blocking pump: each yield gives ready LocalSet and runtime work an
         // opportunity to run. Tokio does not guarantee exact scheduling order or driver-poll
         // counts here, so only the number of yield attempts is part of this implementation.
@@ -287,7 +302,7 @@ impl TokioPort {
         let local =
             current_local_set().expect("TokioPort is driving without a registered LocalSet");
         local.block_on(&self.runtime, async {
-            for _ in 0..POLL_YIELD_BUDGET {
+            for _ in 0..budget {
                 tokio::task::yield_now().await;
             }
         });

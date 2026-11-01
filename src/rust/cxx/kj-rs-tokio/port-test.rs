@@ -300,3 +300,86 @@ fn timeouts_are_accurate_to_the_wheel() {
         "woke far too late: {elapsed:?}"
     );
 }
+
+#[test]
+fn zero_timeout_polls_ready_tasks_without_parking() {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
+
+    let parks = Arc::new(AtomicUsize::new(0));
+    let on_park = Arc::clone(&parks);
+    let mut builder = Builder::new_current_thread();
+    builder.on_thread_park(move || {
+        on_park.fetch_add(1, Ordering::SeqCst);
+    });
+    let port = TokioPort::with_builder(&mut builder);
+    let ran = Rc::new(Cell::new(false));
+    let task_ran = Rc::clone(&ran);
+    let _task = spawn(async move {
+        task_ran.set(true);
+    });
+
+    // Count parks rather than elapsed time, so the test doesn't depend on machine load.
+    for _ in 0..32 {
+        assert!(!port.wait_timeout_ns(0));
+    }
+    assert!(ran.get());
+    assert_eq!(parks.load(Ordering::SeqCst), 0);
+
+    // A wake() that arrived before the poll must still be reported.
+    port.wake();
+    assert!(port.wait_timeout_ns(0));
+    assert!(!port.wait_timeout_ns(0));
+    assert_eq!(parks.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn zero_timeout_polls_io_without_parking() {
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
+
+    use tokio::io::AsyncReadExt;
+
+    let parks = Arc::new(AtomicUsize::new(0));
+    let on_park = Arc::clone(&parks);
+    let mut builder = Builder::new_current_thread();
+    builder.on_thread_park(move || {
+        on_park.fetch_add(1, Ordering::SeqCst);
+    });
+    let port = TokioPort::with_builder(&mut builder);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    peer.write_all(&[42]).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    // Wait until the byte has arrived (peek doesn't consume it), so the socket is
+    // already readable when Tokio starts watching it.
+    let mut byte = [0];
+    assert_eq!(stream.peek(&mut byte).unwrap(), 1);
+    assert_eq!(byte, [42]);
+    stream.set_nonblocking(true).unwrap();
+    let mut stream = tokio::net::TcpStream::from_std(stream).unwrap();
+    let received = Rc::new(Cell::new(false));
+    let task_received = Rc::clone(&received);
+    let task = spawn(async move {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, [42]);
+        task_received.set(true);
+    });
+    // The socket is already readable. Bound the number of waits, not elapsed time.
+    let mut waits = 0;
+    while !received.get() {
+        waits += 1;
+        assert!(!port.wait_timeout_ns(0));
+        assert_eq!(parks.load(Ordering::SeqCst), 0);
+        assert!(
+            received.get() || !task.is_finished(),
+            "read task ended without reading the byte"
+        );
+        assert!(
+            received.get() || waits < 100,
+            "ready read made no progress in 100 waits"
+        );
+    }
+}
